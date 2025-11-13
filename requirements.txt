@@ -3,5 +3,11 @@ sqlmodel
 uvicorn[standard]
 gunicorn
 pydantic
+pydantic-settings
 psycopg2-binary
 python-dotenv
+asyncpg
+pytest
+pytest-asyncio
+httpx
+alembic

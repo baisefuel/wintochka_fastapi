@@ -1,113 +1,162 @@
-from sqlmodel import Session, select
+from sqlalchemy import select
+from sqlmodel.ext.asyncio.session import AsyncSession
 from app.models.order import Order, Side, Trade
 from app.models.user import UserBalance
 from app.schemas.openapi_schemas import OrderStatus
 from app.core.config import settings
 from uuid import UUID
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Union
+from sqlalchemy.sql import func as sa_func
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Path, status
+from app.core.db import get_async_session
+from app.api.deps import get_current_admin
+from app.models.user import User as UserModel
+from app.models.instrument import Instrument as InstrumentModel
+from app.schemas.openapi_schemas import (
+    Ok, User, Instrument as InstrumentSchema, 
+    Body_deposit_api_v1_admin_balance_deposit_post as DepositBody,
+    Body_withdraw_api_v1_admin_balance_withdraw_post as WithdrawBody
+)
+from app.crud.balance import async_update_or_create_balance
 
+api_logger = logging.getLogger("api")
 DEFAULT_QUOTE_ASSET = settings.quote_asset
 
 class BalanceError(Exception):
     pass
 
 
-def _get_balance_model(session: Session, user_uuid: UUID, ticker: str) -> UserBalance:
-    balance = session.exec(
+async def _get_balance_model(session: AsyncSession, user_uuid: UUID, ticker: str) -> UserBalance:
+    balance: Union[UserBalance, None] = (await session.exec(
         select(UserBalance).where(
             UserBalance.user_uuid == user_uuid, 
             UserBalance.ticker == ticker
         )
-    ).first()
+    )).scalars().first()
     
     if balance is None:
         balance = UserBalance(user_uuid=user_uuid, ticker=ticker, available=0, reserved=0)
         session.add(balance)
-        session.commit()
-        session.refresh(balance)
+        await session.flush() 
+        await session.refresh(balance) 
         
     return balance
 
 
-def reserve_asset(session: Session, user_uuid: UUID, ticker: str, amount: int):
+async def async_reserve_asset(session: AsyncSession, user_uuid: UUID, ticker: str, amount: int):
     if amount <= 0: return
 
-    balance = _get_balance_model(session, user_uuid, ticker)
-    
-    if balance.available < amount:
-        raise BalanceError(f"Insufficient available {ticker}. Need {amount}, have {balance.available}")
+    try:
+        balance = await _get_balance_model(session, user_uuid, ticker)
         
-    balance.available -= amount
-    balance.reserved += amount
-    session.add(balance)
+        if balance.available < amount:
+            error_msg = f"Insufficient available {ticker}. Need {amount}, have {balance.available}"
+            api_logger.warning(
+                f'Balance reserve failed. User: {user_uuid}, Ticker: {ticker}, Amount: {amount}, Detail: {error_msg}'
+            )
+            raise BalanceError(error_msg)
+            
+        balance.available -= amount
+        balance.reserved += amount
+        session.add(balance)
+        api_logger.info(
+            f'Asset reserved successfully. User: {user_uuid}, Ticker: {ticker}, Amount: {amount}'
+        )
+    except BalanceError:
+        raise
+    except Exception as e:
+        api_logger.error(f'DB error during asset reservation for user {user_uuid}', exc_info=e)
+        raise
 
 
-def unreserve_asset(session: Session, user_uuid: UUID, ticker: str, amount: int):
+async def async_unreserve_asset(session: AsyncSession, user_uuid: UUID, ticker: str, amount: int):
     if amount <= 0: return
 
-    balance = _get_balance_model(session, user_uuid, ticker)
-    
-    if balance.reserved < amount:
-        raise BalanceError(f"Insufficient reserved {ticker}. Need {amount}, have {balance.reserved}")
+    try:
+        balance = await _get_balance_model(session, user_uuid, ticker)
         
-    balance.reserved -= amount
-    balance.available += amount
-    session.add(balance)
+        if balance.reserved < amount:
+            error_msg = f"Insufficient reserved {ticker}. Need {amount}, have {balance.reserved}"
+            api_logger.error(
+                f'Asset unreserve failed: reserved amount mismatch. User: {user_uuid}, Ticker: {ticker}, Amount: {amount}, Detail: {error_msg}'
+            )
+            raise BalanceError(error_msg)
+            
+        balance.reserved -= amount
+        balance.available += amount
+        session.add(balance)
+        api_logger.info(
+            f'Asset unreserved successfully. User: {user_uuid}, Ticker: {ticker}, Amount: {amount}'
+        )
+    except BalanceError:
+        raise
+    except Exception as e:
+        api_logger.error(f'DB error during asset unreservation for user {user_uuid}', exc_info=e)
+        raise
 
 
-def execute_trade(session: Session, 
-                  taker_order: Order, 
-                  maker_order: Order, 
-                  trade_qty: int, 
-                  trade_price: int) -> Trade:
+async def async_execute_trade(session: AsyncSession,
+                              taker_order: Order, 
+                              maker_order: Order, 
+                              trade_qty: int, 
+                              trade_price: int) -> Trade:
     
     base_asset = taker_order.ticker
     quote_asset = DEFAULT_QUOTE_ASSET
     cost = trade_qty * trade_price
 
-    
     if taker_order.side == Side.BUY:
         reserved_to_unreserve = trade_qty * taker_order.price
-        unreserve_asset(session, taker_order.user_uuid, quote_asset, reserved_to_unreserve)
+        await async_unreserve_asset(session, taker_order.user_uuid, quote_asset, reserved_to_unreserve)
         
-        balance_base = _get_balance_model(session, taker_order.user_uuid, base_asset)
+        balance_base = await _get_balance_model(session, taker_order.user_uuid, base_asset)
         balance_base.available += trade_qty
+        session.add(balance_base) 
         
-        balance_quote = _get_balance_model(session, taker_order.user_uuid, quote_asset)
+        balance_quote = await _get_balance_model(session, taker_order.user_uuid, quote_asset)
         balance_quote.available -= cost
+        session.add(balance_quote)
         
     else:
         reserved_to_unreserve = trade_qty
-        unreserve_asset(session, taker_order.user_uuid, base_asset, reserved_to_unreserve)
+        await async_unreserve_asset(session, taker_order.user_uuid, base_asset, reserved_to_unreserve)
 
-        balance_base = _get_balance_model(session, taker_order.user_uuid, base_asset)
+        balance_base = await _get_balance_model(session, taker_order.user_uuid, base_asset)
         balance_base.available -= trade_qty
+        session.add(balance_base)
         
-        balance_quote = _get_balance_model(session, taker_order.user_uuid, quote_asset)
+        balance_quote = await _get_balance_model(session, taker_order.user_uuid, quote_asset)
         balance_quote.available += cost
+        session.add(balance_quote)
 
     
     if maker_order.side == Side.BUY:
         reserved_to_unreserve = trade_qty * maker_order.price
-        unreserve_asset(session, maker_order.user_uuid, quote_asset, reserved_to_unreserve)
+        await async_unreserve_asset(session, maker_order.user_uuid, quote_asset, reserved_to_unreserve)
         
-        balance_base = _get_balance_model(session, maker_order.user_uuid, base_asset)
+        balance_base = await _get_balance_model(session, maker_order.user_uuid, base_asset)
         balance_base.available += trade_qty
+        session.add(balance_base) 
         
-        balance_quote = _get_balance_model(session, maker_order.user_uuid, quote_asset)
+        balance_quote = await _get_balance_model(session, maker_order.user_uuid, quote_asset)
         balance_quote.available -= cost 
+        session.add(balance_quote)
         
     else:
         reserved_to_unreserve = trade_qty
-        unreserve_asset(session, maker_order.user_uuid, base_asset, reserved_to_unreserve)
+        await async_unreserve_asset(session, maker_order.user_uuid, base_asset, reserved_to_unreserve)
 
-        balance_base = _get_balance_model(session, maker_order.user_uuid, base_asset)
+        balance_base = await _get_balance_model(session, maker_order.user_uuid, base_asset)
         balance_base.available -= trade_qty
+        session.add(balance_base)
         
-        balance_quote = _get_balance_model(session, maker_order.user_uuid, quote_asset)
+        balance_quote = await _get_balance_model(session, maker_order.user_uuid, quote_asset)
         balance_quote.available += cost
+        session.add(balance_quote)
 
+    
     trade = Trade(
         order_id=taker_order.id,
         timestamp=datetime.utcnow(),
@@ -116,13 +165,19 @@ def execute_trade(session: Session,
         price=trade_price,
     )
     session.add(trade)
+    
+    api_logger.info(
+        f'Trade executed successfully. Ticker: {base_asset}, Qty: {trade_qty}, Price: {trade_price}, Taker ID: {taker_order.id}, Maker ID: {maker_order.id}'
+    )
+    
     return trade
 
 
-def try_to_match_order(session: Session, new_order: Order) -> Tuple[List[Trade], bool]:
+async def async_try_to_match_order(session: AsyncSession, new_order: Order) -> Tuple[List[Trade], bool]:
+    
+    api_logger.info(f'Starting match attempt for order {new_order.id}')
     
     is_buy = new_order.side == Side.BUY
-    
     opposite_side = Side.SELL if is_buy else Side.BUY
     
     query = select(Order).where(
@@ -132,7 +187,7 @@ def try_to_match_order(session: Session, new_order: Order) -> Tuple[List[Trade],
     ).order_by(
         Order.price.asc() if is_buy else Order.price.desc(),
         Order.timestamp.asc() 
-    )
+    ).with_for_update()
     
     if new_order.price is not None:
         if is_buy:
@@ -140,8 +195,7 @@ def try_to_match_order(session: Session, new_order: Order) -> Tuple[List[Trade],
         else:
             query = query.where(Order.price >= new_order.price)
             
-    
-    counter_orders = session.exec(query).all()
+    counter_orders = (await session.exec(query)).scalars().all() 
     
     remaining_qty = new_order.qty - new_order.filled
     trades = []
@@ -156,9 +210,9 @@ def try_to_match_order(session: Session, new_order: Order) -> Tuple[List[Trade],
         
         trade_price = maker_order.price
         if trade_price is None: 
-            continue
+             continue
 
-        trade = execute_trade(session, new_order, maker_order, trade_qty, trade_price)
+        trade = await async_execute_trade(session, new_order, maker_order, trade_qty, trade_price) 
         trades.append(trade)
 
         new_order.filled += trade_qty
@@ -173,34 +227,49 @@ def try_to_match_order(session: Session, new_order: Order) -> Tuple[List[Trade],
 
     if new_order.filled >= new_order.qty:
         new_order.status = OrderStatus.EXECUTED
+        api_logger.info(f'Order {new_order.id} fully executed. Trades: {len(trades)}')
         return trades, False
     
     if new_order.price is not None:
         new_order.status = OrderStatus.PARTIALLY_EXECUTED if new_order.filled > 0 else OrderStatus.NEW
+        api_logger.info(f'Order {new_order.id} partially matched or remains new. Trades: {len(trades)}')
         return trades, True
     else:
         new_order.status = OrderStatus.EXECUTED
+        api_logger.info(f'Market Order {new_order.id} executed with available liquidity. Trades: {len(trades)}')
         return trades, False
 
 
-def cancel_order_and_unreserve(session: Session, order: Order):
+async def async_cancel_order_and_unreserve(session: AsyncSession, order: Order): 
     
     if order.status in [OrderStatus.EXECUTED, OrderStatus.CANCELLED]:
-        raise BalanceError("Order is already executed or cancelled.")
+        error_msg = f"Order {order.id} is already {order.status.value}."
+        api_logger.warning(
+            f'Cancellation attempt failed. Order ID: {order.id}, User ID: {order.user_uuid}, Detail: {error_msg}'
+        )
+        raise BalanceError(error_msg)
         
     remaining_qty = order.qty - order.filled
     
     if order.side == Side.BUY:
         asset_to_unreserve = DEFAULT_QUOTE_ASSET
-        amount_to_unreserve = remaining_qty * order.price
+        amount_to_unreserve = remaining_qty * (order.price or 0)
     else:
         asset_to_unreserve = order.ticker
         amount_to_unreserve = remaining_qty
         
     try:
-        unreserve_asset(session, order.user_uuid, asset_to_unreserve, amount_to_unreserve)
+        await async_unreserve_asset(session, order.user_uuid, asset_to_unreserve, amount_to_unreserve)
     except BalanceError as e:
-        print(f"Error unreserving funds for order {order.id}: {e}")
-
+        api_logger.critical(
+            f'Failed to unreserve funds for order {order.id}. Data inconsistency suspected!',
+            exc_info=e
+        )
+        raise
+        
     order.status = OrderStatus.CANCELLED
     session.add(order)
+    
+    api_logger.info(
+        f'Order successfully cancelled and funds unreserved. Order ID: {order.id}, User ID: {order.user_uuid}'
+    )

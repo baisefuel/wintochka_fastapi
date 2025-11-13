@@ -10,33 +10,62 @@ services:
       POSTGRES_DB: ${DB_NAME}
     volumes:
       - postgres_data:/var/lib/postgresql/data/
+      - ./db_init:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 5
-      
+  
+  alembic-up:
+    build: .
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - .:/app
+  
   api:
     build: .
     restart: always
     environment:
       APP_NAME: ${APP_NAME}
       APP_ENV: ${APP_ENV}
-      
-      DB_HOST: db 
-      DB_PORT: ${DB_PORT}
+      DB_HOST: db
+      DB_PORT: 5432
       DB_NAME: ${DB_NAME}
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
-      
       SECRET_KEY: ${SECRET_KEY}
-      GUNICORN_WORKERS: 4
-      
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
-    
+      alembic-up:
+        condition: service_completed_successfully
+
+  tests:
+    build: .
+    command: sh -c "alembic upgrade head && pytest -v"
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/test_${DB_NAME}
+      DB_NAME: test_${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      SECRET_KEY: ${SECRET_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+      alembic-up:
+        condition: service_completed_successfully 
+    volumes:
+      - .:/app
+
 volumes:
   postgres_data:

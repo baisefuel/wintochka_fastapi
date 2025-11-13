@@ -1,8 +1,9 @@
 from fastapi import Header, HTTPException, Depends, status
 from typing import Optional
-from sqlmodel import Session, select
+from sqlalchemy import select
+from sqlmodel.ext.asyncio.session import AsyncSession
 from app.models.user import User as UserModel, UserRole
-from app.core.db import get_session
+from app.core.db import get_async_session
 
 
 def parse_token(auth_header: Optional[str]) -> Optional[str]:
@@ -14,9 +15,9 @@ def parse_token(auth_header: Optional[str]) -> Optional[str]:
     return None
 
 
-def get_current_user(
+async def get_current_user(
     authorization: Optional[str] = Header(None),
-    session: Session = Depends(get_session)
+    session: AsyncSession = Depends(get_async_session) 
 ) -> UserModel:
     api_key = parse_token(authorization)
     if not api_key:
@@ -25,9 +26,9 @@ def get_current_user(
             detail="Invalid or missing API key"
         )
         
-    user = session.exec(
+    user = (await session.exec(
         select(UserModel).where(UserModel.api_key == api_key, UserModel.is_active == True)
-    ).first()
+    )).scalars().first()
     
     if not user:
         raise HTTPException(
@@ -37,7 +38,7 @@ def get_current_user(
     return user
 
 
-def get_current_admin(user: UserModel = Depends(get_current_user)) -> UserModel:
+async def get_current_admin(user: UserModel = Depends(get_current_user)) -> UserModel:
     if user.role != UserRole.ADMIN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
