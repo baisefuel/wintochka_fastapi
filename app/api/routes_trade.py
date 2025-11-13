@@ -46,6 +46,8 @@ async def get_balances(
     user: UserModel = Depends(get_current_user), 
     session: AsyncSession = Depends(get_async_session)
 ):
+    user_uuid_str = str(user.uuid)
+    
     try:
         balances = (await session.exec(
             select(UserBalance).where(UserBalance.user_uuid == user.uuid)
@@ -53,12 +55,12 @@ async def get_balances(
         result = {b.ticker: (b.available or 0) for b in balances}
         
         api_logger.info(
-            f'User balances fetched. User ID: {user.uuid}, Balances: {result}'
+            f'User balances fetched. User ID: {user_uuid_str}, Balances: {result}'
         )
         
         return result
     except Exception as e:
-        api_logger.error(f'Error fetching balances for user {user.uuid}', exc_info=e)
+        api_logger.error(f'Error fetching balances for user {user_uuid_str}', exc_info=e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail="Internal error fetching balances."
@@ -95,6 +97,10 @@ async def create_order(
         price=price if is_limit_order else None 
     )
 
+    user_uuid_str = str(user.uuid)
+    order_ticker = order.ticker
+    order_type_str = "LIMIT" if is_limit_order else "MARKET"
+
     try:
         if amount_to_reserve > 0:
             await async_reserve_asset(session, user.uuid, asset_to_reserve, amount_to_reserve)
@@ -102,19 +108,21 @@ async def create_order(
         session.add(order)
         await session.flush()
         await session.refresh(order)
+        
+        order_id = order.id 
 
         await async_try_to_match_order(session, order)
 
         await session.commit()
         
         api_logger.info(
-            f'Order created and processed. Order ID: {order.id}, User ID: {user.uuid}, Ticker: {order.ticker}, Type: {"LIMIT" if is_limit_order else "MARKET"}'
+            f'Order created and processed. Order ID: {order_id}, User ID: {user_uuid_str}, Ticker: {order_ticker}, Type: {order_type_str}'
         )
         
     except BalanceError as e:
         await session.rollback()
         api_logger.warning(
-            f'Balance error for user {user.uuid}: {str(e)}. Asset: {asset_to_reserve}, Amount: {amount_to_reserve}'
+            f'Balance error for user {user_uuid_str}: {str(e)}. Asset: {asset_to_reserve}, Amount: {amount_to_reserve}'
         )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, 
@@ -127,7 +135,7 @@ async def create_order(
     except Exception as e:
         await session.rollback()
         api_logger.error(
-            f'Critical error processing order for user {user.uuid}', 
+            f'Critical error processing order for user {user_uuid_str}', 
             exc_info=e
         )
         raise HTTPException(
@@ -135,7 +143,7 @@ async def create_order(
             detail="Error during order processing."
         )
         
-    return CreateOrderResponse(order_id=order.id)
+    return CreateOrderResponse(order_id=order_id)
 
 
 @router.get("/order", 
@@ -147,6 +155,8 @@ async def list_orders(
     user: UserModel = Depends(get_current_user), 
     session: AsyncSession = Depends(get_async_session)
 ):
+    user_uuid_str = str(user.uuid)
+    
     try:
         orders = (await session.exec(
             select(Order).where(Order.user_uuid == user.uuid)
@@ -170,12 +180,12 @@ async def list_orders(
                 ))
                 
         api_logger.info(
-            f'User orders listed. User ID: {user.uuid}, Count: {len(orders)}'
+            f'User orders listed. User ID: {user_uuid_str}, Count: {len(orders)}'
         )
         return result
         
     except Exception as e:
-        api_logger.error(f'Error listing orders for user {user.uuid}', exc_info=e)
+        api_logger.error(f'Error listing orders for user {user_uuid_str}', exc_info=e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail="Error fetching order list."
@@ -192,6 +202,8 @@ async def get_order(
     user: UserModel = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session)
 ):
+    user_uuid_str = str(user.uuid)
+    
     try:
         order = (await session.exec(
             select(Order).where(Order.id == order_id, Order.user_uuid == user.uuid)
@@ -199,7 +211,7 @@ async def get_order(
         
         if not order:
             api_logger.warning(
-                f'Order not found or access denied. User ID: {user.uuid}, Order ID: {order_id}'
+                f'Order not found or access denied. User ID: {user_uuid_str}, Order ID: {order_id}'
             )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -226,14 +238,14 @@ async def get_order(
             )
             
         api_logger.info(
-            f'Order details fetched. User ID: {user.uuid}, Order ID: {order_id}'
+            f'Order details fetched. User ID: {user_uuid_str}, Order ID: {order_id}'
         )
         return response
         
     except HTTPException:
         raise
     except Exception as e:
-        api_logger.error(f'Error fetching order {order_id} details', exc_info=e)
+        api_logger.error(f'Error fetching order {order_id} details for user {user_uuid_str}', exc_info=e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail="Error fetching order details."
@@ -241,23 +253,23 @@ async def get_order(
 
 
 @router.delete("/order/{order_id}", 
-                 response_model=Ok, 
-                 summary="Cancel Order",
-                 description="Отмена заявки и возврат зарезервированных средств.",
-                 tags=["order"])
+               response_model=Ok, 
+               summary="Cancel Order",
+               description="Отмена заявки и возврат зарезервированных средств.",
+               tags=["order"])
 async def cancel_order(
     order_id: UUID4 = Path(..., title="Order Id"),
     user: UserModel = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session)
 ):
-    
+    user_uuid_str = str(user.uuid)
     order: Optional[Order] = (await session.exec(
-        select(Order).where(Order.id == order_id, Order.user_uuid == user.uuid)
+        select(Order).where(Order.id == order_id, Order.user_uuid == user.uuid).with_for_update() 
     )).scalars().first()
     
     if not order:
         api_logger.warning(
-            f'Cancellation failed: Order not found or access denied. User ID: {user.uuid}, Order ID: {order_id}'
+            f'Cancellation failed: Order not found or access denied. User ID: {user_uuid_str}, Order ID: {order_id}'
         )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -267,20 +279,21 @@ async def cancel_order(
                 error_type="not_found"
             )
         )
+    order_id_str = str(order.id)
         
     try:
         await async_cancel_order_and_unreserve(session, order)
-        
+
         await session.commit()
         
         api_logger.info(
-            f'Order successfully cancelled. User ID: {user.uuid}, Order ID: {order_id}'
+            f'Order successfully cancelled. User ID: {user_uuid_str}, Order ID: {order_id_str}'
         )
         
     except BalanceError as e:
         await session.rollback()
         api_logger.warning(
-            f'Cancellation failed due to BalanceError: {str(e)}. User ID: {user.uuid}, Order ID: {order_id}'
+            f'Cancellation failed due to BalanceError: {str(e)}. User ID: {user_uuid_str}, Order ID: {order_id_str}'
         )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, 
@@ -293,7 +306,7 @@ async def cancel_order(
     except Exception as e:
         await session.rollback()
         api_logger.error(
-            f'Critical error during cancellation of order {order_id}', 
+            f'Critical error during cancellation of order {order_id_str} by user {user_uuid_str}', 
             exc_info=e
         )
         raise HTTPException(

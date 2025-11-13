@@ -4,6 +4,7 @@ from uuid import UUID
 from app.models.user import UserBalance
 from typing import Optional
 import logging
+from sqlalchemy import select as sa_select
 
 api_logger = logging.getLogger("api")
 
@@ -14,27 +15,28 @@ async def async_update_or_create_balance(
     ticker: str, 
     amount: int
 ) -> Optional[UserBalance]:
+    user_uuid_str = str(user_uuid)
+    operation_type = "Update"
     
     try:
         result = await session.exec(
             select(UserBalance).where(
                 UserBalance.user_uuid == user_uuid,
                 UserBalance.ticker == ticker
-            )
+            ).with_for_update() 
         )
-        balance: Optional[UserBalance] = result.first()
-        
-        operation_type = "Updated"
+        balance: Optional[UserBalance] = result.scalars().first()
         
         if balance:
             old_available = balance.available
+            
             balance.available += amount
             session.add(balance) 
             
             api_logger.info(
                 f'Balance updated for {ticker}',
                 extra={
-                    'user_uuid': str(user_uuid),
+                    'user_uuid': user_uuid_str,
                     'ticker': ticker,
                     'amount_change': amount,
                     'available_before': old_available,
@@ -42,7 +44,7 @@ async def async_update_or_create_balance(
                 }
             )
         else:
-            operation_type = "Created"
+            operation_type = "Create"
             new_balance = UserBalance(
                 user_uuid=user_uuid,
                 ticker=ticker,
@@ -55,7 +57,7 @@ async def async_update_or_create_balance(
             api_logger.info(
                 f'New balance created for {ticker}',
                 extra={
-                    'user_uuid': str(user_uuid),
+                    'user_uuid': user_uuid_str,
                     'ticker': ticker,
                     'initial_available': amount
                 }
@@ -67,7 +69,7 @@ async def async_update_or_create_balance(
 
     except Exception as e:
         api_logger.error(
-            f'Critical error during {operation_type} balance operation for user {user_uuid} and ticker {ticker}', 
+            f'Critical error during {operation_type} balance operation for user {user_uuid_str} and ticker {ticker}', 
             exc_info=e
         )
         raise

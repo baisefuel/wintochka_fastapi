@@ -32,7 +32,8 @@ async def delete_user(
     session: AsyncSession = Depends(get_async_session)
 ):
     try:
-        user: Union[UserModel, None] = (await session.exec(select(UserModel).where(UserModel.uuid == user_id))).first()
+        admin_uuid_str = str(admin_user.uuid)
+        user: Union[UserModel, None] = (await session.exec(select(UserModel).where(UserModel.uuid == user_id))).scalars().first()
         
         if not user:
             api_logger.warning(f'Admin {admin_user.uuid} failed to delete user: {user_id}. User not found.')
@@ -44,7 +45,7 @@ async def delete_user(
         await session.refresh(user)
         
         api_logger.info(
-            f'User successfully deactivated by admin {admin_user.uuid}. Target User ID: {user_id}'
+            f'User successfully deactivated by admin {admin_uuid_str}. Target User ID: {user_id}'
         )
         
         return User(id=user.uuid, name=user.name, role=user.role, api_key=user.api_key)
@@ -103,9 +104,10 @@ async def withdraw(
     session: AsyncSession = Depends(get_async_session)
 ):
     try:
-        user = (await session.exec(select(UserModel).where(UserModel.uuid == body.user_id))).first()
+        admin_uuid_str = str(admin_user.uuid)
+        user = (await session.exec(select(UserModel).where(UserModel.uuid == body.user_id))).scalars().first()
         if not user:
-            api_logger.warning(f'Admin {admin_user.uuid} failed withdraw from {body.user_id}: User not found.')
+            api_logger.warning(f'Admin {admin_uuid_str} failed withdraw from {body.user_id}: User not found.')
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
             
         balance = (await session.exec(
@@ -128,7 +130,7 @@ async def withdraw(
         await session.commit()
         
         api_logger.info(
-            f'Withdrawal successful by admin {admin_user.uuid}. Target User ID: {body.user_id}, Ticker: {body.ticker}, Amount: {body.amount}'
+            f'Withdrawal successful by admin {admin_uuid_str}. Target User ID: {body.user_id}, Ticker: {body.ticker}, Amount: {body.amount}'
         )
         
         return Ok()
@@ -153,9 +155,10 @@ async def add_instrument(
     session: AsyncSession = Depends(get_async_session)
 ):
     try:
-        existing = (await session.exec(select(InstrumentModel).where(InstrumentModel.ticker == body.ticker))).first()
+        admin_uuid_str = str(admin_user.uuid)
+        existing = (await session.exec(select(InstrumentModel).where(InstrumentModel.ticker == body.ticker))).scalars().first()
         if existing:
-            api_logger.warning(f'Admin {admin_user.uuid} failed to add instrument: {body.ticker} already exists.')
+            api_logger.warning(f'Admin {admin_uuid_str} failed to add instrument: {body.ticker} already exists.')
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Instrument with this ticker already exists.")
             
         instrument = InstrumentModel(name=body.name, ticker=body.ticker, is_active=True)
@@ -163,7 +166,7 @@ async def add_instrument(
         await session.commit()
         
         api_logger.info(
-            f'Instrument successfully added by admin {admin_user.uuid}. Ticker: {body.ticker}, Name: {body.name}'
+            f'Instrument successfully added by admin {admin_uuid_str}. Ticker: {body.ticker}, Name: {body.name}'
         )
         
         return Ok()
@@ -185,10 +188,11 @@ async def delete_instrument(
     session: AsyncSession = Depends(get_async_session)
 ):
     try:
-        instrument: Union[InstrumentModel, None] = (await session.exec(select(InstrumentModel).where(InstrumentModel.ticker == ticker))).first()
+        admin_uuid_str = str(admin_user.uuid)
+        instrument: Union[InstrumentModel, None] = (await session.exec(select(InstrumentModel).where(InstrumentModel.ticker == ticker))).scalars().first()
         
         if not instrument:
-            api_logger.warning(f'Admin {admin_user.uuid} failed to delete instrument: {ticker} not found.')
+            api_logger.warning(f'Admin {admin_uuid_str} failed to delete instrument: {ticker} not found.')
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instrument not found.")
             
         instrument.is_active = False
@@ -196,7 +200,7 @@ async def delete_instrument(
         await session.commit()
         
         api_logger.info(
-            f'Instrument successfully deactivated by admin {admin_user.uuid}. Ticker: {ticker}'
+            f'Instrument successfully deactivated by admin {admin_uuid_str}. Ticker: {ticker}'
         )
         
         return Ok()

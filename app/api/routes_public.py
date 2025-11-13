@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from typing import List
 from uuid import uuid4
+# Используем func как sa_func, как в исходном файле
 from sqlalchemy import select, and_, asc, desc, func as sa_func 
 from sqlmodel.ext.asyncio.session import AsyncSession
 from datetime import datetime
@@ -36,11 +37,12 @@ async def register(body: NewUser, session: AsyncSession = Depends(get_async_sess
         api_key = f"key-{uuid4()}"
         user = UserModel(name=body.name, api_key=api_key, role=UserRole.USER, is_active=True) 
         session.add(user)
+        user_name = user.name
         await session.commit()
         await session.refresh(user)
 
         api_logger.info(
-            f'User registered successfully. User ID: {user.uuid}, Name: {user.name}'
+            f'User registered successfully. User ID: {user.uuid}, Name: {user_name}'
         )
 
         return UserSchema(id=user.uuid, name=user.name, role=user.role, api_key=user.api_key)
@@ -65,7 +67,7 @@ async def register(body: NewUser, session: AsyncSession = Depends(get_async_sess
              description="Список доступных инструментов",)
 async def list_instruments(session: AsyncSession = Depends(get_async_session)):
     try:
-        rows = (await session.exec(select(InstrumentModel).where(InstrumentModel.is_active == True))).all()
+        rows = (await session.exec(select(InstrumentModel).where(InstrumentModel.is_active == True))).scalars().all()
         
         api_logger.info('Successfully retrieved instrument list.')
         
@@ -89,19 +91,19 @@ async def get_orderbook_public(
     session: AsyncSession = Depends(get_async_session)
 ):
     try:
-        remaining_qty = Order.qty - Order.filled
+        remaining_qty_expr = Order.qty - Order.filled
         
         bids_query = (
             select(
                 Order.price.label("price"),
-                sa_func.sum(remaining_qty).label("qty")
+                sa_func.sum(remaining_qty_expr).label("qty")
             )
             .where(
                 and_(
                     Order.ticker == ticker,
                     Order.side == Side.BUY,
-                    Order.status == OrderStatus.NEW,
-                    remaining_qty > 0
+                    Order.status.in_([OrderStatus.NEW, OrderStatus.PARTIALLY_EXECUTED]), 
+                    remaining_qty_expr > 0
                 )
             )
             .group_by(Order.price)
@@ -112,14 +114,14 @@ async def get_orderbook_public(
         asks_query = (
             select(
                 Order.price.label("price"),
-                sa_func.sum(remaining_qty).label("qty")
+                sa_func.sum(remaining_qty_expr).label("qty")
             )
             .where(
                 and_(
                     Order.ticker == ticker,
                     Order.side == Side.SELL,
-                    Order.status == OrderStatus.NEW,
-                    remaining_qty > 0
+                    Order.status.in_([OrderStatus.NEW, OrderStatus.PARTIALLY_EXECUTED]),
+                    remaining_qty_expr > 0
                 )
             )
             .group_by(Order.price)
@@ -166,7 +168,7 @@ async def get_transaction_history(
             .where(TradeModel.ticker == ticker)
             .order_by(TradeModel.timestamp.desc())
             .limit(limit)
-        )).all()
+        )).scalars().all()
 
         result = []
         for r in rows:
