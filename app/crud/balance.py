@@ -2,12 +2,25 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from uuid import UUID
 from app.models.user import UserBalance
-from typing import Optional
+from typing import Optional, Union
 import logging
 from sqlalchemy import select as sa_select
 
 api_logger = logging.getLogger("api")
 
+class BalanceError(Exception):
+    pass
+
+async def _check_and_delete_balance(session: AsyncSession, balance: UserBalance):
+    if balance.available == 0 and balance.reserved == 0:
+        ticker = balance.ticker
+        user_uuid_str = str(balance.user_uuid)
+        
+        await session.delete(balance)
+        
+        api_logger.info(
+            f'Zero balance entry deleted. User: {user_uuid_str}, Ticker: {ticker}'
+        )
 
 async def async_update_or_create_balance(
     session: AsyncSession, 
@@ -25,7 +38,7 @@ async def async_update_or_create_balance(
                 UserBalance.ticker == ticker
             ).with_for_update() 
         )
-        balance: Optional[UserBalance] = result.scalars().first()
+        balance: Optional[UserBalance] = result.first()
         
         if balance:
             old_available = balance.available
@@ -43,29 +56,41 @@ async def async_update_or_create_balance(
                     'available_after': balance.available
                 }
             )
+            
+            await _check_and_delete_balance(session, balance) 
+
         else:
             operation_type = "Create"
-            new_balance = UserBalance(
-                user_uuid=user_uuid,
-                ticker=ticker,
-                available=amount,
-                reserved=0
-            )
-            session.add(new_balance)
-            balance = new_balance
-            
-            api_logger.info(
-                f'New balance created for {ticker}',
-                extra={
-                    'user_uuid': user_uuid_str,
-                    'ticker': ticker,
-                    'initial_available': amount
-                }
-            )
+            if amount > 0:
+                new_balance = UserBalance(
+                    user_uuid=user_uuid,
+                    ticker=ticker,
+                    available=amount,
+                    reserved=0
+                )
+                session.add(new_balance)
+                balance = new_balance
+                
+                api_logger.info(
+                    f'New balance created for {ticker}',
+                    extra={
+                        'user_uuid': user_uuid_str,
+                        'ticker': ticker,
+                        'initial_available': amount
+                    }
+                )
+            else:
+                return None 
 
         await session.flush()
-        await session.refresh(balance)
-        return balance
+        
+        is_balance_persistent = balance and (balance.available != 0 or balance.reserved != 0)
+        
+        if is_balance_persistent:
+            await session.refresh(balance)
+            return balance
+        
+        return None
 
     except Exception as e:
         api_logger.error(

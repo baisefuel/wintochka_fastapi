@@ -125,7 +125,7 @@ async def create_order(
             f'Balance error for user {user_uuid_str}: {str(e)}. Asset: {asset_to_reserve}, Amount: {amount_to_reserve}'
         )
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, 
+            status_code=status.HTTP_400_BAD_REQUEST, 
             detail=create_validation_error_detail(
                 loc=["body", "balance"],
                 msg=str(e),

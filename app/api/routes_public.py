@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from typing import List
 from uuid import uuid4
-# Используем func как sa_func, как в исходном файле
 from sqlalchemy import select, and_, asc, desc, func as sa_func 
 from sqlmodel.ext.asyncio.session import AsyncSession
 from datetime import datetime

@@ -34,10 +34,10 @@ async def lifespan(app: FastAPI):
             print(f"API KEY: TOKEN {admin_key}\n")
             
         instrument_check = await session.exec(
-            select(InstrumentModel).where(InstrumentModel.ticker == "BTC")
+            select(InstrumentModel).where(InstrumentModel.ticker == "RUB")
         )
         if not instrument_check.first():
-            instrument = InstrumentModel(name="Bitcoin", ticker="BTC", is_active=True)
+            instrument = InstrumentModel(name="Ruble", ticker="RUB", is_active=True)
             session.add(instrument)
             
         await session.commit()

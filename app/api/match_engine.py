@@ -4,15 +4,9 @@ from app.models.order import Order, Side, Trade
 from app.models.user import UserBalance
 from app.schemas.openapi_schemas import OrderStatus
 from app.core.config import settings 
-from app.core.db import get_async_session
-from app.api.deps import get_current_admin
-from app.models.user import User as UserModel
-from app.models.instrument import Instrument as InstrumentModel
-from app.crud.balance import async_update_or_create_balance
-from app.schemas.openapi_schemas import (
-    Ok, User, Instrument as InstrumentSchema, 
-    Body_deposit_api_v1_admin_balance_deposit_post as DepositBody,
-    Body_withdraw_api_v1_admin_balance_withdraw_post as WithdrawBody
+from app.crud.balance import (
+    BalanceError,
+    _check_and_delete_balance
 )
 
 from uuid import UUID
@@ -20,14 +14,9 @@ from datetime import datetime
 from typing import List, Tuple, Union
 from sqlalchemy.sql import func as sa_func
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Path, status
-
 
 api_logger = logging.getLogger("api")
 DEFAULT_QUOTE_ASSET = settings.quote_asset
-
-class BalanceError(Exception):
-    pass
 
 
 async def _get_balance_model(session: AsyncSession, user_uuid: UUID, ticker: str) -> UserBalance:
@@ -43,7 +32,6 @@ async def _get_balance_model(session: AsyncSession, user_uuid: UUID, ticker: str
         balance = UserBalance(user_uuid=user_uuid, ticker=ticker, available=0, reserved=0)
         session.add(balance)
         await session.flush() 
-        await session.refresh(balance) 
         
     return balance
 
@@ -96,7 +84,7 @@ async def async_unreserve_asset(session: AsyncSession, user_uuid: UUID, ticker: 
         balance.reserved -= amount
         balance.available += amount
         session.add(balance)
-        
+        await _check_and_delete_balance(session, balance) 
         api_logger.info(
             f'Asset unreserved successfully. User: {user_id_str}, Ticker: {ticker}, Amount: {amount}'
         )
@@ -131,14 +119,15 @@ async def async_execute_trade(session: AsyncSession,
         balance_quote = await _get_balance_model(session, taker_order.user_uuid, quote_asset)
         balance_quote.available -= cost
         session.add(balance_quote)
-        
-    else:
+        await _check_and_delete_balance(session, balance_quote)   
+    else:    
         reserved_to_unreserve = trade_qty
         await async_unreserve_asset(session, taker_order.user_uuid, base_asset, reserved_to_unreserve)
 
         balance_base = await _get_balance_model(session, taker_order.user_uuid, base_asset)
         balance_base.available -= trade_qty
         session.add(balance_base)
+        await _check_and_delete_balance(session, balance_base)
         
         balance_quote = await _get_balance_model(session, taker_order.user_uuid, quote_asset)
         balance_quote.available += cost
@@ -156,14 +145,15 @@ async def async_execute_trade(session: AsyncSession,
         balance_quote = await _get_balance_model(session, maker_order.user_uuid, quote_asset)
         balance_quote.available -= cost 
         session.add(balance_quote)
-        
-    else:
+        await _check_and_delete_balance(session, balance_quote)
+    else: 
         reserved_to_unreserve = trade_qty
         await async_unreserve_asset(session, maker_order.user_uuid, base_asset, reserved_to_unreserve)
 
         balance_base = await _get_balance_model(session, maker_order.user_uuid, base_asset)
         balance_base.available -= trade_qty
         session.add(balance_base)
+        await _check_and_delete_balance(session, balance_base)
         
         balance_quote = await _get_balance_model(session, maker_order.user_uuid, quote_asset)
         balance_quote.available += cost
@@ -210,7 +200,7 @@ async def async_try_to_match_order(session: AsyncSession, new_order: Order) -> T
         else:
             query = query.where(Order.price >= new_order.price)
             
-    counter_orders = (await session.exec(query)).scalars().all() 
+    counter_orders = (await session.exec(query)).scalars().all()
     
     remaining_qty = new_order.qty - new_order.filled
     trades = []

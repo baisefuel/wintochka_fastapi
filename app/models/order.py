@@ -1,3 +1,4 @@
+from sqlalchemy import Column, ForeignKey
 from sqlmodel import Field, SQLModel, Relationship
 from uuid import UUID, uuid4
 from enum import Enum as PyEnum
@@ -12,11 +13,15 @@ class Side(str, PyEnum):
 
 class Order(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True, index=True)
-    user_uuid: UUID = Field(foreign_key="user.uuid", index=True)
+    user_uuid: UUID = Field(
+        sa_column=Column(ForeignKey("user.uuid", ondelete="CASCADE"), index=True)
+    )
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     
     side: Side 
-    ticker: str
+    ticker: str = Field(
+        sa_column=Column(ForeignKey("instrument.ticker", ondelete="CASCADE"))
+    )
     qty: int
     price: Optional[int] = None
     
@@ -24,13 +29,19 @@ class Order(SQLModel, table=True):
     filled: int = 0
     
     user: "User" = Relationship(back_populates="orders")
-    trades: List["Trade"] = Relationship(back_populates="order")
-
+    trades: List["Trade"] = Relationship(
+        back_populates="order", 
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
 class Trade(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    order_id: UUID = Field(foreign_key="order.id", index=True)
+    order_id: UUID = Field(
+        sa_column=Column(ForeignKey("order.id", ondelete="CASCADE")) 
+    )
     timestamp: datetime = Field(default_factory=datetime.utcnow)
-    ticker: str
+    ticker: str = Field(
+        sa_column=Column(ForeignKey("instrument.ticker", ondelete="CASCADE"))
+    )
     quantity: int
     price: int
     
