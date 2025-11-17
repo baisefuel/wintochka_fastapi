@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, constr, UUID4
 from uuid import UUID
 from typing import List, Dict, Optional, Union, Literal
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 class Direction(str, Enum):

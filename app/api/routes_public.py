@@ -3,7 +3,7 @@ from typing import List
 from uuid import uuid4
 from sqlalchemy import select, and_, asc, desc, func as sa_func 
 from sqlmodel.ext.asyncio.session import AsyncSession
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 from app.core.db import get_async_session

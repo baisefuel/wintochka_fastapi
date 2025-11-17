@@ -10,7 +10,7 @@ from app.crud.balance import (
 )
 
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Tuple, Union
 from sqlalchemy.sql import func as sa_func
 import logging
@@ -193,7 +193,7 @@ async def async_execute_trade(session: AsyncSession,
 
     trade = Trade(
         order_id=taker_order.id,
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
         ticker=base_asset,
         quantity=trade_qty,
         price=trade_price,
