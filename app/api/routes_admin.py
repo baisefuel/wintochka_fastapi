@@ -99,6 +99,16 @@ async def deposit(
             status_detail = "not found" if not user else "inactive"
             api_logger.warning(f'Admin {admin_uuid_str} failed deposit to {body.user_id}: User {status_detail}.')
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        
+        instrument = (
+            await session.exec(select(InstrumentModel).where(InstrumentModel.ticker == body.ticker))
+        ).scalars().first()
+        
+        if not instrument:
+            api_logger.warning(
+                f'Admin {admin_uuid_str} failed deposit to {body.user_id}: Ticker {body.ticker} not found.'
+            )
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instrument not found.")
             
         await async_update_or_create_balance(session, body.user_id, body.ticker, body.amount)
         await session.commit()
@@ -108,6 +118,7 @@ async def deposit(
         )
         
         return Ok()
+        
     except HTTPException:
         raise
     except Exception as e:
@@ -117,7 +128,6 @@ async def deposit(
             exc_info=e
         )
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error during balance deposit.")
-
 
 @router.post("/balance/withdraw", 
              response_model=Ok, 
