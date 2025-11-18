@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey
+from sqlalchemy import Column, DateTime, ForeignKey
 from sqlmodel import Field, SQLModel, Relationship
 from uuid import UUID, uuid4
 from enum import Enum as PyEnum
@@ -16,7 +16,10 @@ class Order(SQLModel, table=True):
     user_uuid: UUID = Field(
         sa_column=Column(ForeignKey("user.uuid", ondelete="CASCADE"), index=True)
     )
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     
     side: Side 
     ticker: str = Field(
@@ -38,7 +41,10 @@ class Trade(SQLModel, table=True):
     order_id: UUID = Field(
         sa_column=Column(ForeignKey("order.id", ondelete="CASCADE")) 
     )
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     ticker: str = Field(
         sa_column=Column(ForeignKey("instrument.ticker", ondelete="CASCADE"))
     )
