@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 from pydantic import UUID4
 from sqlalchemy import select
@@ -46,8 +47,8 @@ async def get_balances(
     user: UserModel = Depends(get_current_user), 
     session: AsyncSession = Depends(get_async_session)
 ):
+    await asyncio.sleep(0.5)
     user_uuid_str = str(user.uuid)
-    
     try:
         balances = (await session.exec(
             select(UserBalance).where(UserBalance.user_uuid == user.uuid)

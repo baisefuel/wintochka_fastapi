@@ -2,6 +2,7 @@ from sqlalchemy import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from app.models.order import Order, Side, Trade
 from app.models.user import UserBalance
+from sqlalchemy.exc import DBAPIError
 from app.schemas.openapi_schemas import OrderStatus
 from app.core.config import settings 
 from app.crud.balance import (
@@ -12,30 +13,96 @@ from app.crud.balance import (
 from uuid import UUID
 from datetime import datetime, timezone
 from typing import List, Tuple, Union
-from sqlalchemy.sql import func as sa_func
+import asyncio
+import random
 import logging
 
 api_logger = logging.getLogger("api")
 DEFAULT_QUOTE_ASSET = settings.quote_asset
 
+BalanceDict = dict[Tuple[UUID, str], UserBalance]
+
 
 async def _get_balance_model(session: AsyncSession, user_uuid: UUID, ticker: str) -> UserBalance:
+    max_retries = 3
     
-    api_logger.debug(f'Balance lock requested. User: {user_uuid}, Ticker: {ticker}.') 
+    for attempt in range(max_retries):
+        try:
+            api_logger.debug(f'Balance lock requested. User: {user_uuid}, Ticker: {ticker}. Attempt: {attempt + 1}') 
+            
+            balance: Union[UserBalance, None] = (await session.exec(
+                select(UserBalance).where(
+                    UserBalance.user_uuid == user_uuid, 
+                    UserBalance.ticker == ticker
+                ).with_for_update() 
+            )).scalars().first()
+            
+            
+            if balance is None:
+                balance = UserBalance(user_uuid=user_uuid, ticker=ticker, available=0, reserved=0)
+                session.add(balance)
+                await session.flush() 
+                
+            return balance
+            
+        except DBAPIError as e:
+            if "deadlock detected" in str(e).lower() and attempt < max_retries - 1:
+                await session.rollback()
+
+                wait_time = random.uniform(0.01, 0.1) * (2 ** attempt)
+                api_logger.warning(
+                    f'DEADLOCK DETECTED in _get_balance_model for {user_uuid}/{ticker}. Retrying in {wait_time:.4f}s... Attempt: {attempt + 1}'
+                )
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                api_logger.error(f'DB error during balance lock attempt for user {user_uuid}', exc_info=e)
+                raise
+                
+    raise Exception(f"Failed to acquire balance lock for {user_uuid}/{ticker} after {max_retries} attempts.")
+
+
+async def _get_and_lock_balances_canonical(
+    session: AsyncSession, 
+    taker_user_uuid: UUID, 
+    maker_user_uuid: UUID, 
+    base_asset: str, 
+    quote_asset: str
+) -> BalanceDict:
     
-    balance: Union[UserBalance, None] = (await session.exec(
-        select(UserBalance).where(
-            UserBalance.user_uuid == user_uuid, 
-            UserBalance.ticker == ticker
-        ).with_for_update() 
-    )).scalars().first()
+    needed_balances = {
+        (taker_user_uuid, base_asset),
+        (taker_user_uuid, quote_asset),
+        (maker_user_uuid, base_asset),
+        (maker_user_uuid, quote_asset),
+    }
+
+    canonical_keys = sorted(
+        list(needed_balances), 
+        key=lambda x: (x[1], x[0]) 
+    )
+
+    balances: BalanceDict = {}
     
-    if balance is None:
-        balance = UserBalance(user_uuid=user_uuid, ticker=ticker, available=0, reserved=0)
-        session.add(balance)
-        await session.flush() 
+    for user_uuid, ticker in canonical_keys:
+        balance = await _get_balance_model(session, user_uuid, ticker)
+        balances[(user_uuid, ticker)] = balance
+        api_logger.debug(
+            f'Canonical lock acquired. User: {user_uuid}, Ticker: {ticker}.'
+        )
         
-    return balance
+    return balances
+
+
+async def _debit_balance(session: AsyncSession, balance: UserBalance, amount: int):
+    if balance.available < amount:
+        error_msg = f"Insufficient available {balance.ticker} during debit. Need {amount}, have {balance.available}"
+        api_logger.critical(error_msg)
+        raise BalanceError(error_msg)
+    
+    balance.available -= amount
+    session.add(balance)
+    await _check_and_delete_balance(session, balance)
 
 
 async def async_reserve_asset(session: AsyncSession, user_uuid: UUID, ticker: str, amount: int):
@@ -122,72 +189,71 @@ async def async_execute_trade(session: AsyncSession,
         f'--- Trade execution started --- Taker ID: {taker_id_str}, Maker ID: {maker_id_str}, Base: {base_asset}, Quote: {quote_asset}, Qty: {trade_qty}, Price: {trade_price}, Cost: {cost}'
     )
     
+    balances = await _get_and_lock_balances_canonical(
+        session, 
+        taker_order.user_uuid, 
+        maker_order.user_uuid, 
+        base_asset, 
+        quote_asset
+    )
+    
+    TB = balances[(taker_order.user_uuid, base_asset)]
+    TQ = balances[(taker_order.user_uuid, quote_asset)]
+    MB = balances[(maker_order.user_uuid, base_asset)]
+    MQ = balances[(maker_order.user_uuid, quote_asset)]
 
     if taker_order.side == Side.BUY:
-        reserved_to_unreserve = cost
         
         if taker_order.price is not None:
-            api_logger.debug(f'Taker (BUY/Limit) unreserving: {reserved_to_unreserve} {quote_asset}')
-            await async_unreserve_asset(session, taker_order.user_uuid, quote_asset, reserved_to_unreserve)
+            TQ.reserved -= cost
+            TQ.available += cost
+            api_logger.debug(f'Taker (BUY/Limit) unreserved {cost} {quote_asset}. State: A={TQ.available}, R={TQ.reserved}')
         else:
-             api_logger.debug(f'Taker (BUY/Market) skips unreserving: no funds reserved.')
-             
-        balance_base = await _get_balance_model(session, taker_order.user_uuid, base_asset)
-        balance_base.available += trade_qty
-        session.add(balance_base) 
+            api_logger.debug(f'Taker (BUY/Market) skips unreserving.')
+
+        await _debit_balance(session, TQ, cost)
         
-        balance_quote = await _get_balance_model(session, taker_order.user_uuid, quote_asset)
-        balance_quote.available -= cost
-        session.add(balance_quote)
-        await _check_and_delete_balance(session, balance_quote) 
+        TB.available += trade_qty
+        session.add(TB)
         
         api_logger.debug(f'Taker {taker_id_str} (BUY) processed: Got {trade_qty} {base_asset}, Paid {cost} {quote_asset}.')
         
     else:
-        reserved_to_unreserve = trade_qty
-        api_logger.debug(f'Taker (SELL) unreserving: {reserved_to_unreserve} {base_asset}')
-        await async_unreserve_asset(session, taker_order.user_uuid, base_asset, reserved_to_unreserve)
-
-        balance_base = await _get_balance_model(session, taker_order.user_uuid, base_asset)
-        balance_base.available -= trade_qty
-        session.add(balance_base)
-        await _check_and_delete_balance(session, balance_base)
         
-        balance_quote = await _get_balance_model(session, taker_order.user_uuid, quote_asset)
-        balance_quote.available += cost
-        session.add(balance_quote)
+        TB.reserved -= trade_qty
+        TB.available += trade_qty
+        api_logger.debug(f'Taker (SELL) unreserved {trade_qty} {base_asset}. State: A={TB.available}, R={TB.reserved}')
+        
+        await _debit_balance(session, TB, trade_qty)
+        
+        TQ.available += cost
+        session.add(TQ)
         
         api_logger.debug(f'Taker {taker_id_str} (SELL) processed: Paid {trade_qty} {base_asset}, Got {cost} {quote_asset}.')
 
     if maker_order.side == Side.BUY:
-        balance_base = await _get_balance_model(session, maker_order.user_uuid, base_asset)
-        balance_base.available += trade_qty
-        session.add(balance_base) 
         
-        reserved_to_unreserve = cost
-        api_logger.debug(f'Maker (BUY) unreserving: {reserved_to_unreserve} {quote_asset}')
-        await async_unreserve_asset(session, maker_order.user_uuid, quote_asset, reserved_to_unreserve)
+        MQ.reserved -= cost
+        MQ.available += cost
+        api_logger.debug(f'Maker (BUY) unreserved {cost} {quote_asset}. State: A={MQ.available}, R={MQ.reserved}')
+
+        await _debit_balance(session, MQ, cost)
         
-        balance_quote = await _get_balance_model(session, maker_order.user_uuid, quote_asset)
-        balance_quote.available -= cost 
-        session.add(balance_quote)
-        await _check_and_delete_balance(session, balance_quote)
+        MB.available += trade_qty
+        session.add(MB)
         
         api_logger.debug(f'Maker {maker_id_str} (BUY) processed: Got {trade_qty} {base_asset}, Paid {cost} {quote_asset}.')
-
-    else:
-        reserved_to_unreserve = trade_qty
-        api_logger.debug(f'Maker (SELL) unreserving: {reserved_to_unreserve} {base_asset}')
-        await async_unreserve_asset(session, maker_order.user_uuid, base_asset, reserved_to_unreserve)
-
-        balance_base = await _get_balance_model(session, maker_order.user_uuid, base_asset)
-        balance_base.available -= trade_qty
-        session.add(balance_base)
-        await _check_and_delete_balance(session, balance_base)
         
-        balance_quote = await _get_balance_model(session, maker_order.user_uuid, quote_asset)
-        balance_quote.available += cost
-        session.add(balance_quote)
+    else:
+        
+        MB.reserved -= trade_qty
+        MB.available += trade_qty
+        api_logger.debug(f'Maker (SELL) unreserved {trade_qty} {base_asset}. State: A={MB.available}, R={MB.reserved}')
+        
+        await _debit_balance(session, MB, trade_qty)
+        
+        MQ.available += cost
+        session.add(MQ)
 
         api_logger.debug(f'Maker {maker_id_str} (SELL) processed: Paid {trade_qty} {base_asset}, Got {cost} {quote_asset}.')
 
@@ -215,7 +281,7 @@ async def async_try_to_match_order(session: AsyncSession, new_order: Order) -> T
     order_type = 'LIMIT' if new_order.price is not None else 'MARKET'
     price_info = f'Price: {new_order.price}' if new_order.price is not None else 'Price: N/A'
     
-    api_logger.info(f'Starting match attempt for **{order_type}** order {new_order_id_str} (User: {user_id_str}). Side: {new_order.side.value}, Qty: {new_order.qty}, {price_info}')    
+    api_logger.info(f'Starting match attempt for **{order_type}** order {new_order_id_str} (User: {user_id_str}). Side: {new_order.side.value}, Qty: {new_order.qty}, {price_info}')     
     is_buy = new_order.side == Side.BUY
     opposite_side = Side.SELL if is_buy else Side.BUY
     
@@ -252,8 +318,8 @@ async def async_try_to_match_order(session: AsyncSession, new_order: Order) -> T
         trade_price = maker_order.price
         
         if trade_price is None: 
-             api_logger.warning(f'Skipping Maker {maker_order.id} as price is None. Likely corrupted data in order book.')
-             continue
+            api_logger.warning(f'Skipping Maker {maker_order.id} as price is None. Likely corrupted data in order book.')
+            continue
 
         api_logger.debug(
             f'Match found. Taker: {new_order_id_str} ({remaining_qty} rem.), Maker: {maker_order.id} ({maker_remaining_qty} rem.). Trade Qty: {trade_qty}, Price: {trade_price}'
@@ -290,6 +356,7 @@ async def async_try_to_match_order(session: AsyncSession, new_order: Order) -> T
 
 
 async def async_cancel_order_and_unreserve(session: AsyncSession, order: Order): 
+    
     order_id_str = str(order.id)
     user_uuid_str = str(order.user_uuid)
     
@@ -307,8 +374,8 @@ async def async_cancel_order_and_unreserve(session: AsyncSession, order: Order):
         amount_to_unreserve = remaining_qty * (order.price or 0)
         
         if order.price is None:
-             api_logger.info(f'Cancellation: Market BUY Order {order_id_str} has no reserved funds (amount_to_unreserve=0), skipping unreserve call.')
-             
+            api_logger.info(f'Cancellation: Market BUY Order {order_id_str} has no reserved funds (amount_to_unreserve=0), skipping unreserve call.')
+            
     else:
         asset_to_unreserve = order.ticker
         amount_to_unreserve = remaining_qty
