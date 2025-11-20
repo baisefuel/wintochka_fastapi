@@ -9,6 +9,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core.db import get_async_session 
 from app.core.config import settings
 from app.api.deps import get_current_user
+from app.models.instrument import Instrument
 from app.models.user import User as UserModel, UserBalance
 from app.models.order import Order, Side
 from app.schemas.openapi_schemas import (
@@ -16,6 +17,7 @@ from app.schemas.openapi_schemas import (
     CreateOrderResponse, Ok, Direction
 )
 from app.api.match_engine import (
+    async_execute_match_with_retry,
     async_try_to_match_order, 
     async_reserve_asset, 
     async_cancel_order_and_unreserve, 
@@ -85,6 +87,15 @@ async def create_order(
     user: UserModel = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session)
 ):
+    instrument = (
+        await session.exec(select(Instrument).where(Instrument.ticker == body.ticker))
+    ).scalars().first()
+
+    if not instrument:
+        api_logger.warning(
+            f'User {user.uuid} failed order creation: Ticker {body.ticker} not found in DB.'
+        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instrument not found.")
     is_limit_order = isinstance(body, LimitOrderBody)
     price = body.price if is_limit_order else 0 
     
@@ -117,9 +128,7 @@ async def create_order(
         
         order_id = order.id 
 
-        await async_try_to_match_order(session, order)
-
-        await session.commit()
+        await async_execute_match_with_retry(session, order)
         
         api_logger.info(
             f'Order created and processed. Order ID: {order_id}, User ID: {user_uuid_str}, Ticker: {order_ticker}, Type: {order_type_str}'
