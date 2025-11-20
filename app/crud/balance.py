@@ -1,17 +1,25 @@
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from uuid import UUID
-from app.models.user import UserBalance
 from typing import Optional, Union
 import logging
+from app.core.config import settings
 from sqlalchemy import select as sa_select
+from sqlalchemy.dialects.postgresql import insert
+
+from app.models.user import UserBalance
+
 
 api_logger = logging.getLogger("api")
 
 class BalanceError(Exception):
     pass
 
+
 async def _check_and_delete_balance(session: AsyncSession, balance: UserBalance):
+    if balance.ticker == settings.quote_asset:
+        return
+
     if balance.available == 0 and balance.reserved == 0:
         ticker = balance.ticker
         user_uuid_str = str(balance.user_uuid)
@@ -22,73 +30,63 @@ async def _check_and_delete_balance(session: AsyncSession, balance: UserBalance)
             f'Zero balance entry deleted. User: {user_uuid_str}, Ticker: {ticker}'
         )
 
+
 async def async_update_or_create_balance(
     session: AsyncSession, 
     user_uuid: UUID, 
     ticker: str, 
     amount: int
 ) -> Optional[UserBalance]:
+
+    if amount == 0:
+        return None
+        
     user_uuid_str = str(user_uuid)
-    operation_type = "Update"
+    
+    insert_stmt = insert(UserBalance).values(
+        user_uuid=user_uuid,
+        ticker=ticker,
+        available=amount,
+        reserved=0
+    )
+
+    do_update_stmt = insert_stmt.on_conflict_do_update(
+        index_elements=['user_uuid', 'ticker'],
+        set_={
+            'available': UserBalance.available + amount
+        }
+    ).returning(UserBalance)
+    
+    operation_type = "Upsert"
     
     try:
-        result = await session.exec(
-            select(UserBalance).where(
-                UserBalance.user_uuid == user_uuid,
-                UserBalance.ticker == ticker
-            ).with_for_update() 
-        )
-        balance: Optional[UserBalance] = result.first()
+        result = await session.execute(do_update_stmt)
+        updated_balance: Optional[UserBalance] = result.scalars().first()
         
-        if balance:
-            old_available = balance.available
-            
-            balance.available += amount
-            session.add(balance) 
+        if updated_balance:
             
             api_logger.info(
-                f'Balance updated for {ticker}',
+                f'Balance {operation_type}d for {ticker}',
                 extra={
                     'user_uuid': user_uuid_str,
                     'ticker': ticker,
                     'amount_change': amount,
-                    'available_before': old_available,
-                    'available_after': balance.available
+                    'available_after': updated_balance.available
                 }
             )
             
-            await _check_and_delete_balance(session, balance) 
+            if updated_balance.available < 0:
+                error_msg = f"Available balance became negative after update for {ticker}. Value: {updated_balance.available}"
+                api_logger.critical(error_msg)
+                raise BalanceError(error_msg)
 
-        else:
-            operation_type = "Create"
-            if amount > 0:
-                new_balance = UserBalance(
-                    user_uuid=user_uuid,
-                    ticker=ticker,
-                    available=amount,
-                    reserved=0
-                )
-                session.add(new_balance)
-                balance = new_balance
+            is_balance_persistent = updated_balance.available != 0 or updated_balance.reserved != 0
+            
+            if not is_balance_persistent:
+                await _check_and_delete_balance(session, updated_balance)
+                return None
                 
-                api_logger.info(
-                    f'New balance created for {ticker}',
-                    extra={
-                        'user_uuid': user_uuid_str,
-                        'ticker': ticker,
-                        'initial_available': amount
-                    }
-                )
-            else:
-                return None 
-
-        await session.flush()
-        
-        is_balance_persistent = balance and (balance.available != 0 or balance.reserved != 0)
-        
-        if is_balance_persistent:
-            await session.refresh(balance)
-            return balance
+            return updated_balance
         
         return None
 
@@ -98,3 +96,22 @@ async def async_update_or_create_balance(
             exc_info=e
         )
         raise
+
+
+async def async_debit_available_balance(
+    session: AsyncSession, user_uuid: UUID, ticker: str, amount: int
+) -> Optional[UserBalance]:
+    if amount <= 0:
+        return None
+
+    
+    updated_balance = await async_update_or_create_balance(
+        session, user_uuid, ticker, -amount
+    )
+
+    if updated_balance and updated_balance.available < 0:
+        error_msg = f"Attempted debit failed. Insufficient available {ticker}. Needed {amount}, result available: {updated_balance.available}"
+        api_logger.critical(error_msg)
+        raise BalanceError(error_msg)
+
+    return updated_balance

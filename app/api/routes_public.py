@@ -80,9 +80,9 @@ async def list_instruments(session: AsyncSession = Depends(get_async_session)):
 
 
 @router.get("/orderbook/{ticker}",
-             response_model=L2OrderBook, 
-             summary="Get Orderbook",
-             description="Текущие заявки",
+            response_model=L2OrderBook, 
+            summary="Get Orderbook",
+            description="Текущие заявки",
 )
 async def get_orderbook_public(
     ticker: str = Path(..., title="Ticker"),
@@ -90,7 +90,20 @@ async def get_orderbook_public(
     session: AsyncSession = Depends(get_async_session)
 ):
     try:
+        instrument = (
+            await session.exec(
+                select(InstrumentModel).where(InstrumentModel.ticker == ticker)
+            )
+        ).scalars().first()
+        
+        if not instrument:
+            api_logger.warning(f'Orderbook request failed: Instrument {ticker} not found.')
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instrument not found.")
+
+        
         remaining_qty_expr = Order.qty - Order.filled
+        
+        price_is_not_null = Order.price.is_not(None) 
         
         bids_query = (
             select(
@@ -102,7 +115,8 @@ async def get_orderbook_public(
                     Order.ticker == ticker,
                     Order.side == Side.BUY,
                     Order.status.in_([OrderStatus.NEW, OrderStatus.PARTIALLY_EXECUTED]), 
-                    remaining_qty_expr > 0
+                    remaining_qty_expr > 0,
+                    price_is_not_null
                 )
             )
             .group_by(Order.price)
@@ -120,7 +134,8 @@ async def get_orderbook_public(
                     Order.ticker == ticker,
                     Order.side == Side.SELL,
                     Order.status.in_([OrderStatus.NEW, OrderStatus.PARTIALLY_EXECUTED]),
-                    remaining_qty_expr > 0
+                    remaining_qty_expr > 0,
+                    price_is_not_null
                 )
             )
             .group_by(Order.price)
@@ -132,7 +147,7 @@ async def get_orderbook_public(
         asks_results = (await session.exec(asks_query)).mappings().all()
 
         api_logger.info(
-            f'Successfully retrieved orderbook for {ticker}. Bid count: {len(bids_results)}'
+            f'Successfully retrieved orderbook for {ticker}. Bid levels: {len(bids_results)}, Ask levels: {len(asks_results)}'
         )
         
         bid_levels = [Level(price=r['price'], qty=r['qty']) for r in bids_results]
@@ -142,6 +157,9 @@ async def get_orderbook_public(
             bid_levels=bid_levels,
             ask_levels=ask_levels
         )
+        
+    except HTTPException:
+        raise
     except Exception as e:
         api_logger.error(f'Failed to retrieve orderbook for {ticker}', exc_info=e)
         raise HTTPException(
@@ -162,6 +180,19 @@ async def get_transaction_history(
     session: AsyncSession = Depends(get_async_session),
 ):
     try:
+        instrument = (
+            await session.exec(
+                select(InstrumentModel).where(InstrumentModel.ticker == ticker)
+            )
+        ).scalars().first()
+        
+        if not instrument:
+            api_logger.warning(f'Transaction history request failed: Instrument {ticker} not found.')
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, 
+                detail=f"Instrument {ticker} not found."
+            )
+
         rows = (await session.exec(
             select(TradeModel)
             .where(TradeModel.ticker == ticker)
@@ -169,24 +200,30 @@ async def get_transaction_history(
             .limit(limit)
         )).scalars().all()
 
-        result = []
-        for r in rows:
-            result.append(
-                Transaction(
-                    ticker=r.ticker,
-                    amount=int(r.quantity),
-                    price=int(r.price),
-                    timestamp=r.timestamp,
-                )
+        result = [
+            Transaction(
+                ticker=r.ticker,
+                amount=int(r.quantity),
+                price=int(r.price),
+                timestamp=r.timestamp,
             )
+            for r in rows
+        ]
         
         api_logger.info(
-            f'Successfully retrieved {len(rows)} transactions for {ticker}. Count: {len(rows)}'
+            f'Transaction history successfully retrieved. Ticker: {ticker}, Limit: {limit}, Count: {len(result)}'
         )
         
         return result
+        
+    except HTTPException:
+        raise
+        
     except Exception as e:
-        api_logger.error(f'Failed to retrieve transactions for {ticker}.', exc_info=e)
+        api_logger.error(
+            f'CRITICAL FAILURE to retrieve transaction history. Ticker: {ticker}, Limit: {limit}.', 
+            exc_info=e
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error retrieving transaction history."

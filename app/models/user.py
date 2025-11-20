@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey
+from sqlalchemy import Column, ForeignKey, UniqueConstraint
 from sqlmodel import Field, SQLModel, Relationship
 from uuid import UUID, uuid4
 from enum import Enum as PyEnum
@@ -34,3 +34,9 @@ class UserBalance(SQLModel, table=True):
     reserved: int = 0
     
     user: "User" = Relationship(back_populates="balances")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_uuid", "ticker", name="unique_user_ticker_constraint"
+        ),
+    )

@@ -40,7 +40,7 @@ def create_validation_error_detail(loc: List[Union[str, int]], msg: str, error_t
 
 
 @router.get("/balance", 
-             response_model=Dict[str, int], 
+             response_model=Dict[str, int],
              summary="Get Balances",
              tags=["balance"])
 async def get_balances(
@@ -53,10 +53,18 @@ async def get_balances(
         balances = (await session.exec(
             select(UserBalance).where(UserBalance.user_uuid == user.uuid)
         )).scalars().all()
-        result = {b.ticker: (b.available or 0) for b in balances}
+        
+        result = {}
+        for b in balances:
+            available_val = b.available or 0
+            reserved_val = b.reserved or 0
+            
+            total_balance = available_val + reserved_val
+            
+            result[b.ticker] = total_balance
         
         api_logger.info(
-            f'User balances fetched. User ID: {user_uuid_str}, Balances: {result}'
+            f'User balances fetched. User ID: {user_uuid_str}, Total Balances: {result}'
         )
         
         return result
@@ -102,10 +110,7 @@ async def create_order(
     order_ticker = order.ticker
     order_type_str = "LIMIT" if is_limit_order else "MARKET"
 
-    try:
-        if amount_to_reserve > 0:
-            await async_reserve_asset(session, user.uuid, asset_to_reserve, amount_to_reserve)
-        
+    try:        
         session.add(order)
         await session.flush()
         await session.refresh(order)
