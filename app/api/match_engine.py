@@ -5,7 +5,7 @@ from app.models.user import UserBalance
 from sqlalchemy.exc import DBAPIError
 from app.schemas.openapi_schemas import OrderStatus
 from app.core.config import settings 
-from app.crud.balance import BalanceError, _check_and_delete_balance 
+from app.crud.balance import BalanceError, async_update_or_create_balance 
 
 from uuid import UUID
 from datetime import datetime, timezone
@@ -84,9 +84,6 @@ async def async_unreserve_asset(session: AsyncSession, user_uuid: UUID, ticker: 
     updated_balance: Optional[UserBalance] = (await session.exec(
         select(UserBalance).where(UserBalance.user_uuid == user_uuid, UserBalance.ticker == ticker)
     )).scalars().first()
-    
-    if updated_balance:
-        await _check_and_delete_balance(session, updated_balance) 
 
     api_logger.info(
         f'Asset unreserved successfully. User: {user_uuid}, Ticker: {ticker}, Amount: {amount}.'
@@ -134,13 +131,7 @@ async def async_execute_trade(session: AsyncSession,
         api_logger.critical(f"Balance check failed: Buyer {buyer_id} insufficient {quote_asset} (Debit Field={balance_field_buyer.key}). Need {cost}.")
         raise BalanceError(f"Buyer {buyer_id} insufficient {quote_asset} for trade.")
 
-    stmt_credit_base = (
-        sa_update(UserBalance)
-        .where(UserBalance.user_uuid == buyer_id, UserBalance.ticker == base_asset)
-        .values(available=UserBalance.available + trade_qty)
-    )
-    await session.execute(stmt_credit_base)
-    
+    await async_update_or_create_balance(session, buyer_id, base_asset, trade_qty)    
 
     is_seller_taker = (seller_order.id == taker_order.id)
     balance_field_seller = UserBalance.available if is_seller_taker else UserBalance.reserved
@@ -161,12 +152,8 @@ async def async_execute_trade(session: AsyncSession,
         api_logger.critical(f"Balance check failed: Seller {seller_id} insufficient {base_asset} (Debit Field={balance_field_seller.key}). Need {trade_qty}.")
         raise BalanceError(f"Seller {seller_id} insufficient {base_asset} for trade.")
     
-    stmt_credit_quote = (
-        sa_update(UserBalance)
-        .where(UserBalance.user_uuid == seller_id, UserBalance.ticker == quote_asset)
-        .values(available=UserBalance.available + cost)
-    )
-    await session.execute(stmt_credit_quote)
+    await async_update_or_create_balance(session, seller_id, quote_asset, cost)
+
     
     trade = Trade(
         order_id=taker_order.id,
@@ -372,7 +359,7 @@ async def async_cancel_order_and_unreserve(session: AsyncSession, order: Order):
             f'Failed to unreserve funds for order {order_id_str}. Data inconsistency suspected!',
             exc_info=e
         )
-        raise
+        pass
         
     order.status = OrderStatus.CANCELLED
     session.add(order)

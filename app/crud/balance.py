@@ -15,22 +15,6 @@ api_logger = logging.getLogger("api")
 class BalanceError(Exception):
     pass
 
-
-async def _check_and_delete_balance(session: AsyncSession, balance: UserBalance):
-    if balance.ticker == settings.quote_asset:
-        return
-
-    if balance.available == 0 and balance.reserved == 0:
-        ticker = balance.ticker
-        user_uuid_str = str(balance.user_uuid)
-        
-        await session.delete(balance)
-        
-        api_logger.info(
-            f'Zero balance entry deleted. User: {user_uuid_str}, Ticker: {ticker}'
-        )
-
-
 async def async_update_or_create_balance(
     session: AsyncSession, 
     user_uuid: UUID, 
@@ -79,12 +63,6 @@ async def async_update_or_create_balance(
                 error_msg = f"Available balance became negative after update for {ticker}. Value: {updated_balance.available}"
                 api_logger.critical(error_msg)
                 raise BalanceError(error_msg)
-
-            is_balance_persistent = updated_balance.available != 0 or updated_balance.reserved != 0
-            
-            if not is_balance_persistent:
-                await _check_and_delete_balance(session, updated_balance)
-                return None
                 
             return updated_balance
         

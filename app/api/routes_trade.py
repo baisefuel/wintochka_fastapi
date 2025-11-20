@@ -102,13 +102,29 @@ async def create_order(
     asset_to_reserve: str
     amount_to_reserve: int
     
+
     if body.direction == Direction.BUY:
         asset_to_reserve = DEFAULT_QUOTE_ASSET
         amount_to_reserve = body.qty * price if is_limit_order else 0 
     else:
         asset_to_reserve = body.ticker
         amount_to_reserve = body.qty
-        
+    
+    balance_toreserve = (
+        await session.exec(
+            select(UserBalance).where(
+                UserBalance.user_uuid == user.uuid,
+                UserBalance.ticker == asset_to_reserve
+            )
+        )
+    ).scalars().first()
+
+    if balance_toreserve.available < amount_to_reserve:
+        api_logger.warning(
+            f'User {user.uuid} BALANCE ERROR {balance_toreserve} {asset_to_reserve}< {amount_to_reserve}'
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Balance too small(")
+
     order = Order(
         user_uuid=user.uuid,
         side=Side(body.direction.value),
